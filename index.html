@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>자리배정 도우미</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" rel="stylesheet">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    * { font-family: 'Pretendard', -apple-system, sans-serif; letter-spacing: -0.01em; }
+    .cell-inactive { background-image: repeating-linear-gradient(45deg,#f3f4f6 25%,transparent 25%,transparent 75%,#f3f4f6 75%,#f3f4f6), repeating-linear-gradient(45deg,#f3f4f6 25%,#e5e7eb 25%,#e5e7eb 75%,#f3f4f6 75%,#f3f4f6); background-size:8px 8px; background-position:0 0,4px 4px; }
+    .drag-over { outline:2px dashed #2563eb !important; outline-offset:-2px; border-radius:8px; }
+    .g0{background:#dbeafe;border-color:#3b82f6;color:#1e40af} .g1{background:#dcfce7;border-color:#22c55e;color:#166534}
+    .g2{background:#fef9c3;border-color:#eab308;color:#854d0e} .g3{background:#fee2e2;border-color:#ef4444;color:#991b1b}
+    .g4{background:#f3e8ff;border-color:#a855f7;color:#6b21a8} .g5{background:#ffedd5;border-color:#f97316;color:#9a3412}
+    .g6{background:#ccfbf1;border-color:#14b8a6;color:#134e4a} .g7{background:#fce7f3;border-color:#ec4899;color:#9d174d}
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .spin { animation:spin .8s linear infinite; display:inline-block; }
+    @media print { .no-print{display:none!important} .print-grid{page-break-inside:avoid} }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen text-gray-900">
+<div id="root"></div>
+
+<script>
+/* ======================================================
+   설정값 — 배포 전 수정 필요
+   ====================================================== */
+const GOOGLE_CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+const ALLOWED_DOMAIN   = 'dajeong.sjedues.kr';
+const APPS_SCRIPT_URL  = 'https://script.google.com/macros/s/AKfycbyVLeu1SpoSnIZubZQQIDPVDotxOWA1zQT8n2VbpB8XwS1M2nfy8RjorI4yy53CBsxr/exec';
+
+/* ======================================================
+   서버 호출 (fetch → Apps Script doPost)
+   ====================================================== */
+async function call(fn, args) {
+  const body = JSON.stringify({ fn, email: AUTH.user?.email, args });
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body,
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.result;
+}
+
+/* ======================================================
+   유틸
+   ====================================================== */
+const genId   = () => Date.now().toString(36) + Math.random().toString(36).slice(2,5);
+const shuffle = a => { const b=[...a]; for(let i=b.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[b[i],b[j]]=[b[j],b[i]];} return b; };
+const esc     = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const GNAME   = i => ['1모둠','2모둠','3모둠','4모둠','5모둠','6모둠','7모둠','8모둠'][i];
+const stuName   = s => typeof s==='string'?s:s.name;
+const stuGender = s => typeof s==='string'?null:s.gender;
+
+async function hashPin(pin, email) {
+  const enc = new TextEncoder();
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(pin+email+'seatapp-v1'));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+/* ======================================================
+   앱 상태
+   ====================================================== */
+// screen: loading | google-login | pin-setup | pin | home | app
+let AUTH = { screen:'loading', user:null, pinInput:'', pinConfirm:'', pinStep:1, attempts:0, error:'', busy:false };
+let S    = { classrooms:[], activeId:null, tab:'setup', deskMode:'toggle', paintGid:0, assignment:null, dragSrc:null, lineup:null, genderBalance:false };
+
+const SESSION_KEY  = 'pin_sess_v1';
+const SESSION_DAYS = 7;
+function savePinSession(email) { localStorage.setItem(SESSION_KEY, JSON.stringify({email, exp:Date.now()+SESSION_DAYS*86400*1000})); }
+function clearPinSession()     { localStorage.removeItem(SESSION_KEY); }
+function loadPinSession()      { try{const s=JSON.parse(localStorage.getItem(SESSION_KEY)||'null');return s&&s.exp>Date.now()?s:null;}catch(e){return null;} }
+
+function makeGrid(r,c){ return {rows:r,cols:c,cells:Array.from({length:r},()=>Array.from({length:c},()=>({active:true,gid:null})))}; }
+function makeClassroom(n){ return {id:genId(),name:n,students:[],grid:makeGrid(5,6),history:[],lineupHistory:[]}; }
+const active = () => S.classrooms.find(c=>c.id===S.activeId);
+
+/* ======================================================
+   데이터 영속성
+   ====================================================== */
+async function persist() {
+  const cl=active(); if(!cl)return;
+  localStorage.setItem('seat_cache', JSON.stringify({classrooms:S.classrooms, activeId:S.activeId}));
+  call('saveClassroom',{classroom:cl}).catch(()=>{});
+}
+async function loadData() {
+  try{const c=JSON.parse(localStorage.getItem('seat_cache')||'{}');if(c.classrooms?.length){S.classrooms=c.classrooms;S.activeId=c.activeId;}}catch(e){}
+  try{
+    const res=await call('getClassrooms');
+    if(res.classrooms.length){S.classrooms=res.classrooms;S.activeId=res.classrooms[0].id;}
+    else{const cl=makeClassroom('1학년 1반');S.classrooms=[cl];S.activeId=cl.id;await call('saveClassroom',{classroom:cl});}
+  }catch(e){if(!S.classrooms.length){const cl=makeClassroom('1학년 1반');S.classrooms=[cl];S.activeId=cl.id;}}
+}
+
+/* ======================================================
+   구글 로그인 (GIS)
+   ====================================================== */
+function initGoogleLogin() {
+  if (typeof google === 'undefined' || !google.accounts) {
+    setTimeout(initGoogleLogin, 300); return;
+  }
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: handleGoogleToken,
+    auto_select: false,
+    cancel_on_tap_outside: false,
+  });
+  const btnEl = document.getElementById('google-signin-btn');
+  if (btnEl) {
+    google.accounts.id.renderButton(btnEl, {
+      theme: 'outline', size: 'large', width: 280, text: 'signin_with', locale: 'ko'
+    });
+  }
+}
+
+function handleGoogleToken(response) {
+  try {
+    const payload = JSON.parse(atob(response.credential.split('.')[1]));
+    const email   = payload.email || '';
+    if (!email.endsWith('@' + ALLOWED_DOMAIN)) {
+      AUTH.error = `@${ALLOWED_DOMAIN} 계정으로만 접근할 수 있습니다.\n현재 계정: ${email}`;
+      renderRoot(); return;
+    }
+    AUTH.user  = { email, name: payload.name || email.split('@')[0] };
+    AUTH.error = '';
+    afterGoogleLogin();
+  } catch(e) {
+    AUTH.error = '로그인 처리 중 오류가 발생했습니다.';
+    renderRoot();
+  }
+}
+
+async function afterGoogleLogin() {
+  // PIN 세션 확인
+  const sess = loadPinSession();
+  if (sess && sess.email === AUTH.user.email) {
+    AUTH.screen = 'home'; await loadData(); renderRoot(); return;
+  }
+  // PIN 설정 여부 확인
+  AUTH.screen = 'loading'; renderRoot();
+  try {
+    const pinData = await call('getUserPin');
+    AUTH.screen = pinData.pinHash ? 'pin' : 'pin-setup';
+  } catch(e) {
+    AUTH.screen = 'pin-setup';
+  }
+  renderRoot();
+}
+
+/* ======================================================
+   PIN 로직
+   ====================================================== */
+async function submitPin() {
+  const {pinInput, user, screen} = AUTH; if(pinInput.length!==4)return;
+  if(screen==='pin'){
+    const hash=await hashPin(pinInput,user.email); AUTH.busy=true; renderRoot();
+    try{
+      const res=await call('verifyUserPin',{pinHash:hash});
+      if(res.match){savePinSession(user.email);AUTH.screen='home';AUTH.pinInput='';AUTH.attempts=0;await loadData();renderRoot();}
+      else{AUTH.attempts++;AUTH.error=AUTH.attempts>=5?'5회 실패. 페이지를 새로고침 후 다시 시도하세요.':`PIN이 맞지 않습니다. (${AUTH.attempts}/5)`;AUTH.pinInput='';}
+    }catch(e){AUTH.error='오류: '+e.message;AUTH.pinInput='';}
+    AUTH.busy=false; renderRoot();
+  } else {
+    if(AUTH.pinStep===1){AUTH.pinConfirm=pinInput;AUTH.pinInput='';AUTH.pinStep=2;renderRoot();}
+    else{
+      if(pinInput!==AUTH.pinConfirm){AUTH.error='PIN이 일치하지 않습니다.';AUTH.pinInput='';AUTH.pinConfirm='';AUTH.pinStep=1;renderRoot();return;}
+      const hash=await hashPin(pinInput,user.email); AUTH.busy=true; renderRoot();
+      try{
+        await call('saveUserPin',{pinHash:hash,displayName:user.name});
+        savePinSession(user.email);AUTH.screen='home';AUTH.pinInput='';await loadData();renderRoot();
+      }catch(e){AUTH.error='저장 오류: '+e.message;AUTH.pinInput='';AUTH.busy=false;renderRoot();}
+    }
+  }
+}
+
+function handlePinKey(d){
+  if(AUTH.busy)return;
+  if(d==='del')AUTH.pinInput=AUTH.pinInput.slice(0,-1);
+  else if(AUTH.pinInput.length<4){AUTH.pinInput+=d;if(AUTH.pinInput.length===4)setTimeout(submitPin,120);}
+  renderRoot();
+}
+function logout(){clearPinSession();AUTH.screen='google-login';AUTH.pinInput='';AUTH.attempts=0;AUTH.error='';AUTH.user=null;renderRoot();setTimeout(initGoogleLogin,100);}
+
+/* ======================================================
+   렌더링
+   ====================================================== */
+function renderRoot(){
+  const root=document.getElementById('root');
+  if(AUTH.screen==='loading'){
+    root.className='min-h-screen flex items-center justify-center bg-gray-50';
+    root.innerHTML='<div class="text-gray-400 text-sm flex items-center gap-2"><span class="spin">⧗</span> 불러오는 중...</div>';
+  } else if(AUTH.screen==='google-login'){
+    root.className='min-h-screen flex items-center justify-center bg-gray-50';
+    root.innerHTML=renderGoogleLogin(); setTimeout(initGoogleLogin,100);
+  } else if(AUTH.screen==='pin'||AUTH.screen==='pin-setup'){
+    root.className='min-h-screen flex items-center justify-center bg-gray-50';
+    root.innerHTML=renderPin(); bindPin();
+  } else if(AUTH.screen==='home'){
+    root.className='max-w-5xl mx-auto px-4 py-6';
+    root.innerHTML=renderHome(); bindHome();
+  } else {
+    root.className='max-w-5xl mx-auto px-4 py-6';
+    root.innerHTML=renderApp(); bind();
+  }
+}
+
+/* ── 구글 로그인 화면 ─────────────────────────────── */
+function renderGoogleLogin(){
+  return `
+<div class="w-full max-w-sm mx-auto px-4">
+  <div class="bg-white rounded-2xl shadow-sm p-10 text-center">
+    <div class="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-5">
+      <svg class="w-8 h-8 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/>
+      </svg>
+    </div>
+    <h1 class="text-2xl font-bold mb-1">자리배정 도우미</h1>
+    <p class="text-sm text-gray-500 mb-1">다정초등학교 선생님 전용</p>
+    <p class="text-xs text-gray-400 mb-8">@${ALLOWED_DOMAIN} 계정으로 로그인하세요</p>
+    ${AUTH.error ? `<div class="mb-5 px-4 py-3 bg-red-50 rounded-xl text-sm text-red-600 text-left whitespace-pre-line">${esc(AUTH.error)}</div>` : ''}
+    <div id="google-signin-btn" class="flex justify-center"></div>
+  </div>
+</div>`;
+}
+
+/* ── PIN 화면 ─────────────────────────────────────── */
+function renderPin(){
+  const isSetup=AUTH.screen==='pin-setup';
+  const {pinInput,pinStep,error,user,busy}=AUTH;
+  const title=isSetup?(pinStep===1?'PIN 번호 설정':'PIN 번호 확인'):'PIN 번호 입력';
+  const sub=isSetup?(pinStep===1?'사용할 4자리 PIN을 입력하세요':'한 번 더 입력해주세요'):`${user?.name||''} 선생님`;
+  return `<div class="w-full max-w-xs mx-auto px-4"><div class="bg-white rounded-2xl shadow-sm p-8">
+    <div class="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center mx-auto mb-4">
+      <svg class="w-6 h-6 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+    </div>
+    <h2 class="text-lg font-bold text-center mb-1">${title}</h2>
+    <p class="text-sm text-gray-500 text-center mb-2">${esc(sub)}</p>
+    ${user?.email?`<p class="text-xs text-gray-400 text-center mb-5">${esc(user.email)}</p>`:'<div class="mb-5"></div>'}
+    <div class="flex justify-center gap-4 mb-6">${[0,1,2,3].map(i=>`<div class="w-4 h-4 rounded-full border-2 transition-all ${i<pinInput.length?'bg-blue-600 border-blue-600':'border-gray-300'}"></div>`).join('')}</div>
+    ${error?`<div class="mb-4 px-3 py-2.5 bg-red-50 rounded-xl text-xs text-red-600 text-center">${esc(error)}</div>`:''}
+    ${busy?`<div class="flex justify-center items-center gap-2 py-6 text-sm text-gray-400"><span class="spin">⧗</span> 처리 중...</div>`:`
+    <div class="grid grid-cols-3 gap-2">
+      ${['1','2','3','4','5','6','7','8','9','','0','del'].map(k=>{if(k==='')return'<div></div>';return`<button data-pin="${k}" class="h-14 rounded-xl text-lg font-semibold transition-all active:scale-95 ${k==='del'?'bg-gray-100 hover:bg-gray-200 text-gray-600 text-base':'bg-gray-50 hover:bg-blue-50 hover:text-blue-700 text-gray-800'}">${k==='del'?'←':k}</button>`;}).join('')}
+    </div>
+    ${!isSetup?`<button id="btn-reset-pin" class="mt-5 w-full text-xs text-blue-500 hover:text-blue-700 py-1">PIN을 잊어버렸어요</button>`:''}`}
+  </div>
+  ${isSetup?`<p class="text-xs text-center text-gray-400 mt-3">PIN은 구글 시트에 암호화되어 저장됩니다</p>`:''}
+  </div>`;
+}
+function bindPin(){
+  document.querySelectorAll('[data-pin]').forEach(btn=>{btn.onclick=()=>handlePinKey(btn.dataset.pin);});
+  document.getElementById('btn-reset-pin')?.addEventListener('click',()=>{
+    if(!confirm('PIN을 초기화할까요? 다시 설정해야 합니다.'))return;
+    clearPinSession();AUTH.screen='pin-setup';AUTH.pinInput='';AUTH.pinStep=1;AUTH.error='';renderRoot();
+  });
+}
+
+/* ── 홈 화면 ─────────────────────────────────────── */
+function renderHome(){
+  const user=AUTH.user;
+  const total=S.classrooms.reduce((s,c)=>s+c.students.length,0);
+  const h=new Date().getHours();
+  const greeting=h<12?'좋은 아침이에요':h<18?'안녕하세요':'수고하셨어요';
+  const cl=active();
+  return `<div class="space-y-5">
+  <header class="flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-lg flex-shrink-0">${(user?.name||'?')[0]}</div>
+      <div><p class="text-xs text-gray-500">${greeting}</p><p class="text-base font-bold">${esc(user?.name||'')} 선생님</p></div>
+    </div>
+    <button id="btn-logout" class="py-2 px-4 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm text-gray-600 font-medium">로그아웃</button>
+  </header>
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    ${[['등록 학급',S.classrooms.length,'개'],['전체 학생',total,'명'],['배정 기록',S.classrooms.reduce((s,c)=>s+(c.history?.length||0),0),'회'],['줄세우기',S.classrooms.reduce((s,c)=>s+(c.lineupHistory?.length||0),0),'회']].map(([label,val,unit])=>`
+    <div class="bg-white rounded-2xl p-4 shadow-sm"><p class="text-xs text-gray-500 mb-1">${label}</p><p class="text-2xl font-bold text-blue-600">${val}<span class="text-sm font-normal text-gray-400 ml-0.5">${unit}</span></p></div>`).join('')}
+  </div>
+  <div class="bg-white rounded-2xl p-5 shadow-sm">
+    <h2 class="text-base font-bold mb-4">학급 선택</h2>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+      ${S.classrooms.map(c=>`
+      <button data-home-open="${c.id}" class="flex items-center gap-3 p-4 rounded-xl border-2 text-left transition-all ${c.id===S.activeId?'border-blue-500 bg-blue-50':'border-gray-100 hover:border-gray-300 bg-gray-50'}">
+        <div class="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${c.id===S.activeId?'bg-blue-500':'bg-gray-200'}">
+          <svg class="w-5 h-5 ${c.id===S.activeId?'text-white':'text-gray-500'}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0"/></svg>
+        </div>
+        <div class="min-w-0"><p class="font-semibold text-sm truncate">${esc(c.name)}</p><p class="text-xs text-gray-500 mt-0.5">${c.students.length}명 · 배정 ${c.history?.length||0}회</p></div>
+      </button>`).join('')}
+      <button id="btn-new-class" class="flex items-center gap-3 p-4 rounded-xl border-2 border-dashed border-gray-200 hover:border-blue-300 hover:bg-blue-50 transition-all">
+        <div class="w-10 h-10 rounded-xl bg-gray-100 flex items-center justify-center text-gray-400 text-xl">+</div>
+        <p class="text-sm font-medium text-gray-400">새 학급 추가</p>
+      </button>
+    </div>
+  </div>
+  <div class="bg-white rounded-2xl p-5 shadow-sm">
+    <h2 class="text-base font-bold mb-1">빠른 실행</h2>
+    <p class="text-xs text-gray-400 mb-4">${esc(cl?.name||'학급을 선택하세요')}</p>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      ${[{tab:'assign',icon:'M4 6h16M4 10h16M4 14h8',label:'자리 배정'},{tab:'lineup',icon:'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2',label:'줄 세우기'},{tab:'desk',icon:'M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7',label:'책상 배치'},{tab:'setup',icon:'M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z',label:'학생 관리'}].map(({tab,icon,label})=>`
+      <button data-home-tab="${tab}" class="p-4 rounded-xl bg-gray-50 hover:bg-blue-50 transition-colors text-left group">
+        <svg class="w-6 h-6 text-gray-400 group-hover:text-blue-500 mb-2 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="${icon}"/></svg>
+        <p class="text-sm font-semibold text-gray-700 group-hover:text-blue-700 transition-colors">${label}</p>
+      </button>`).join('')}
+    </div>
+  </div>
+  <div class="bg-white rounded-2xl p-5 shadow-sm">
+    <div class="flex items-center justify-between">
+      <div><p class="text-sm font-semibold">PIN 번호 변경</p><p class="text-xs text-gray-400 mt-0.5">${esc(user?.email||'')}</p></div>
+      <button id="btn-change-pin" class="py-2 px-4 bg-gray-100 hover:bg-gray-200 text-sm text-gray-600 rounded-xl font-medium">변경</button>
+    </div>
+  </div>
+  <div class="bg-blue-50 rounded-2xl p-4 flex items-start gap-3">
+    <svg class="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+    <p class="text-xs text-blue-700">모든 데이터는 Google 스프레드시트에 저장됩니다. 어느 컴퓨터에서 로그인해도 내 학급 데이터가 그대로 불러와집니다.</p>
+  </div>
+</div>`;
+}
+function bindHome(){
+  document.getElementById('btn-logout')?.addEventListener('click',logout);
+  document.getElementById('btn-new-class')?.addEventListener('click',async()=>{const name=prompt('새 학급 이름');if(!name)return;const c=makeClassroom(name.trim());S.classrooms.push(c);S.activeId=c.id;await persist();renderRoot();});
+  document.getElementById('btn-change-pin')?.addEventListener('click',()=>{clearPinSession();AUTH.screen='pin-setup';AUTH.pinInput='';AUTH.pinStep=1;AUTH.error='';renderRoot();});
+  document.querySelectorAll('[data-home-open]').forEach(btn=>{btn.addEventListener('click',()=>{S.activeId=btn.dataset.homeOpen;renderRoot();});});
+  document.querySelectorAll('[data-home-tab]').forEach(btn=>{btn.addEventListener('click',()=>{S.tab=btn.dataset.homeTab;AUTH.screen='app';renderRoot();});});
+}
+
+/* ======================================================
+   앱 탭 화면들
+   ====================================================== */
+function renderApp(){
+  const cl=active();
+  const tabs=[{id:'setup',label:'학급 설정'},{id:'desk',label:'책상 배치'},{id:'assign',label:'자리 배정'},{id:'history',label:'기록'},{id:'lineup',label:'줄세우기'}];
+  return `<header class="mb-6 no-print">
+  <div class="flex items-center justify-between flex-wrap gap-3 mb-4">
+    <div class="flex items-center gap-3">
+      <button id="btn-go-home" class="py-2 px-3 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm font-medium text-gray-600">← 홈</button>
+      <h1 class="text-xl font-bold">자리배정 도우미</h1>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-sm font-medium text-gray-600">학급</label>
+      <select id="cl-select" class="py-2 px-3 rounded-xl border border-gray-200 bg-white text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+        ${S.classrooms.map(c=>`<option value="${c.id}" ${c.id===S.activeId?'selected':''}>${esc(c.name)}</option>`).join('')}
+      </select>
+      <button data-act="new-class" class="py-2 px-3 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm font-medium">+ 새 학급</button>
+    </div>
+  </div>
+  <nav class="flex gap-1 border-b border-gray-200">
+    ${tabs.map(t=>`<button data-tab="${t.id}" class="px-4 py-2.5 text-sm font-medium rounded-t-lg transition-colors ${S.tab===t.id?'bg-white border border-b-white border-gray-200 text-blue-600 -mb-px':'text-gray-500 hover:text-gray-700'}">${t.label}</button>`).join('')}
+  </nav>
+</header>
+<main>
+  ${S.tab==='setup'?renderSetup(cl):''}${S.tab==='desk'?renderDesk(cl):''}${S.tab==='assign'?renderAssign(cl):''}${S.tab==='history'?renderHistory(cl):''}${S.tab==='lineup'?renderLineup(cl):''}
+</main>`;
+}
+
+function renderSetup(cl){
+  const mC=cl.students.filter(s=>stuGender(s)==='M').length,fC=cl.students.filter(s=>stuGender(s)==='F').length,nC=cl.students.filter(s=>!stuGender(s)).length;
+  return `<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="space-y-4">
+    <div class="bg-white rounded-2xl p-6 shadow-sm">
+      <h2 class="text-lg font-bold mb-4">학급 정보</h2>
+      <div class="mb-4"><label class="block text-sm font-medium text-gray-700 mb-1">학급 이름</label>
+      <input id="cl-name" type="text" value="${esc(cl.name)}" class="w-full py-2.5 px-4 rounded-xl border border-gray-200 focus:ring-2 focus:ring-blue-500 outline-none text-sm"></div>
+      <div class="flex gap-2">
+        <button data-act="save-name" class="py-2.5 px-5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold">저장</button>
+        <button data-act="delete-class" class="py-2.5 px-5 bg-red-50 hover:bg-red-100 text-red-600 rounded-xl text-sm font-medium">삭제</button>
+      </div>
+    </div>
+    <div class="bg-white rounded-2xl p-6 shadow-sm">
+      <h2 class="text-lg font-bold mb-2">이름 입력</h2>
+      <p class="text-xs text-gray-500 mb-3">한 줄에 한 명. 성별은 오른쪽 카드에서 클릭으로 지정.</p>
+      <label class="block text-sm font-medium text-gray-700 mb-1">학생 이름 목록</label>
+      <textarea id="bulk-input" rows="8" placeholder="홍길동&#10;김영희&#10;박철수" class="w-full py-2.5 px-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-blue-500 outline-none text-sm resize-none">${cl.students.map(s=>stuName(s)).join('\n')}</textarea>
+      <button data-act="bulk-save" class="mt-3 w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold">명단 저장</button>
+    </div>
+  </div>
+  <div class="lg:col-span-2 bg-white rounded-2xl p-6 shadow-sm">
+    <div class="flex items-center justify-between mb-1">
+      <h2 class="text-lg font-bold">성별 지정</h2>
+      <div class="flex gap-3 text-xs">${mC?`<span class="font-semibold text-blue-600">남 ${mC}명</span>`:''}${fC?`<span class="font-semibold text-pink-500">여 ${fC}명</span>`:''}${nC?`<span class="text-gray-400">미지정 ${nC}명</span>`:''}</div>
+    </div>
+    <p class="text-xs text-gray-400 mb-4">카드 클릭마다 미지정 → 남 → 여 순으로 바뀝니다</p>
+    ${cl.students.length===0
+      ?`<div class="py-12 text-center text-gray-400"><p class="font-medium">학생이 없습니다</p><p class="text-sm mt-1">왼쪽에서 이름을 입력하고 저장하세요</p></div>`
+      :`<div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">${cl.students.map((s,i)=>{const g=stuGender(s);const base=g==='M'?'bg-blue-50 border-blue-300 text-blue-800':g==='F'?'bg-pink-50 border-pink-300 text-pink-800':'bg-gray-50 border-gray-200 text-gray-600';const badge=g==='M'?'<span class="block text-xs font-bold text-blue-500 mt-0.5">남</span>':g==='F'?'<span class="block text-xs font-bold text-pink-500 mt-0.5">여</span>':'<span class="block text-xs text-gray-400 mt-0.5">-</span>';return`<button data-act="toggle-gender" data-idx="${i}" class="py-3 px-2 rounded-xl border-2 text-center transition-all hover:shadow-sm active:scale-95 ${base}"><span class="block text-sm font-semibold leading-tight">${esc(stuName(s))}</span>${badge}</button>`;}).join('')}</div>`}
+  </div>
+</div>`;
+}
+
+function renderDesk(cl){
+  const{grid}=cl;
+  return `<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="bg-white rounded-2xl p-5 shadow-sm space-y-4">
+    <h2 class="text-lg font-bold">배치 도구</h2>
+    <div><label class="block text-sm font-medium text-gray-700 mb-1">격자 크기</label>
+    <div class="flex items-center gap-2 flex-wrap">
+      <select id="grid-rows" class="py-2 px-3 rounded-xl border border-gray-200 text-sm outline-none">${[3,4,5,6,7,8].map(n=>`<option ${grid.rows===n?'selected':''}>${n}</option>`).join('')}</select>
+      <span class="text-gray-400 text-sm">행</span>
+      <select id="grid-cols" class="py-2 px-3 rounded-xl border border-gray-200 text-sm outline-none">${[3,4,5,6,7,8].map(n=>`<option ${grid.cols===n?'selected':''}>${n}</option>`).join('')}</select>
+      <span class="text-gray-400 text-sm">열</span>
+      <button data-act="resize-grid" class="py-2 px-3 bg-gray-100 hover:bg-gray-200 rounded-xl text-sm font-medium">적용</button>
+    </div></div>
+    <div><label class="block text-sm font-medium text-gray-700 mb-2">편집 모드</label>
+    <div class="flex gap-2">
+      <button data-act="mode-toggle" class="flex-1 py-2 rounded-xl text-sm font-medium transition-colors ${S.deskMode==='toggle'?'bg-blue-600 text-white':'bg-gray-100 text-gray-700'}">자리 켜기/끄기</button>
+      <button data-act="mode-group" class="flex-1 py-2 rounded-xl text-sm font-medium transition-colors ${S.deskMode==='group'?'bg-blue-600 text-white':'bg-gray-100 text-gray-700'}">모둠 지정</button>
+    </div></div>
+    ${S.deskMode==='group'?`<div><label class="block text-sm font-medium text-gray-700 mb-2">칠할 모둠</label><div class="grid grid-cols-4 gap-1.5">${[0,1,2,3,4,5,6,7].map(i=>`<button data-act="pick-group" data-gid="${i}" class="py-1.5 rounded-lg border-2 text-xs font-semibold g${i} ${S.paintGid===i?'ring-2 ring-offset-1 ring-blue-500':''}">${GNAME(i)}</button>`).join('')}<button data-act="pick-group" data-gid="-1" class="py-1.5 rounded-lg border-2 border-gray-300 text-xs font-semibold bg-white text-gray-500 ${S.paintGid===-1?'ring-2 ring-offset-1 ring-blue-500':''}">해제</button></div></div>`:''}
+    <button data-act="reset-grid" class="w-full py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-sm font-medium">배치 초기화</button>
+  </div>
+  <div class="lg:col-span-2 bg-white rounded-2xl p-5 shadow-sm">
+    <div class="flex items-center justify-between mb-4"><h2 class="text-lg font-bold">책상 배치도</h2><span class="text-sm text-gray-500">활성 ${getSeats(grid).length}자리</span></div>
+    <div class="flex justify-center overflow-x-auto"><div class="inline-block">
+      <div class="mb-2 text-center text-xs text-gray-400 font-medium">— 칠판 —</div>
+      <div class="grid gap-1.5" style="grid-template-columns:repeat(${grid.cols},56px)">
+        ${Array.from({length:grid.rows},(_,r)=>Array.from({length:grid.cols},(_,c)=>{const cell=grid.cells[r][c];const gCls=cell.gid!==null?`g${cell.gid} border-2`:'bg-white border-2 border-gray-200 hover:border-blue-300';return`<div data-act="cell-click" data-r="${r}" data-c="${c}" class="w-14 h-14 rounded-xl cursor-pointer flex items-center justify-center transition-all select-none ${cell.active?gCls:'cell-inactive border-2 border-dashed border-gray-300 rounded-xl'}">${cell.active&&cell.gid!==null?`<span class="text-xs font-medium">${GNAME(cell.gid)}</span>`:''}${!cell.active?'<span class="text-gray-400">×</span>':''}</div>`;}).join('')).flat().join('')}
+      </div>
+    </div></div>
+  </div>
+</div>`;
+}
+
+function getSeats(grid){const s=[];for(let r=0;r<grid.rows;r++)for(let c=0;c<grid.cols;c++)if(grid.cells[r][c].active)s.push({r,c,gid:grid.cells[r][c].gid});return s;}
+function getSeatUnits(seats){const u=[],g={};for(const s of seats){if(s.gid!==null){if(!g[s.gid])g[s.gid]=[];g[s.gid].push(s);}else u.push({gid:null,seats:[s]});}for(const[id,ss]of Object.entries(g))u.push({gid:id,seats:ss});return u;}
+function scoreAssignment(asgn,history,useG){let score=0;const recent=history.slice(-6);if(useG){const cG={};for(const a of asgn)if(a.gid!==null){if(!cG[a.gid])cG[a.gid]=[];cG[a.gid].push(a);}for(const g of Object.values(cG)){const m=g.filter(a=>stuGender(a.student)==='M').length;score+=Math.abs(m-(g.length-m))*3;}}recent.forEach((rec,idx)=>{const w=(idx+1)/recent.length,prev={};for(const a of rec.assignments)prev[stuName(a.student)]=a;for(const a of asgn){const p=prev[stuName(a.student)];if(p&&p.r===a.r&&p.c===a.c)score+=12*w;}const pG={},cG2={};for(const a of rec.assignments)if(a.gid!==null){if(!pG[a.gid])pG[a.gid]=[];pG[a.gid].push(stuName(a.student));}for(const a of asgn)if(a.gid!==null){if(!cG2[a.gid])cG2[a.gid]=[];cG2[a.gid].push(stuName(a.student));}for(const cg of Object.values(cG2))for(const pg of Object.values(pG)){const ov=cg.filter(s=>pg.includes(s)).length;if(ov>=2)score+=ov*4*w;}});return score;}
+function generateAssignment(cl,useG){const{students,grid,history}=cl;if(!students.length)return null;const seats=getSeats(grid);if(!seats.length)return null;const units=getSeatUnits(seats).sort((a,b)=>b.seats.length-a.seats.length);const m=students.filter(s=>stuGender(s)==='M'),f=students.filter(s=>stuGender(s)==='F'),o=students.filter(s=>!stuGender(s));let best=null,bs=Infinity;for(let t=0;t<400;t++){let studs=useG&&m.length&&f.length?buildGO(shuffle(m),shuffle(f),shuffle(o),units):shuffle(students);const su=shuffle(units);const asgn=[];let si=0;for(const unit of su){const us=[];for(let i=0;i<unit.seats.length&&si<studs.length;i++)us.push(studs[si++]);shuffle(us).forEach((student,i)=>{if(unit.seats[i])asgn.push({student,r:unit.seats[i].r,c:unit.seats[i].c,gid:unit.gid});});}const s=scoreAssignment(asgn,history,useG);if(s<bs){bs=s;best=asgn;}}return best;}
+function buildGO(m,f,o,units){const r=[],mQ=[...m],fQ=[...f];for(const u of units){const sz=u.seats.length,mc=Math.round(sz/2),fc=sz-mc;for(let i=0;i<mc&&mQ.length;i++)r.push(mQ.shift());for(let i=0;i<fc&&fQ.length;i++)r.push(fQ.shift());}r.push(...mQ,...fQ,...o);return r;}
+function scoreLineup(order,lh){let score=0;const recent=lh.slice(-6);const key=(a,b)=>[stuName(a),stuName(b)].sort().join('|');const cur=new Set();for(let i=0;i<order.length-1;i++)cur.add(key(order[i],order[i+1]));recent.forEach((rec,idx)=>{const w=(idx+1)/recent.length;const prev=new Set();for(let i=0;i<rec.order.length-1;i++)prev.add(key(rec.order[i],rec.order[i+1]));for(const p of cur)if(prev.has(p))score+=8*w;});return score;}
+function generateLineup(cl){const{students,lineupHistory=[]}=cl;if(!students.length)return null;let best=null,bs=Infinity;for(let t=0;t<500;t++){const o=shuffle(students);const s=scoreLineup(o,lineupHistory);if(s<bs){bs=s;best=o;}}return best;}
+
+function renderAssign(cl){
+  const{grid}=cl;const seats=getSeats(grid);const hasE=cl.students.length>0&&seats.length>0;
+  const hasG=seats.some(s=>s.gid!==null),hasGdr=cl.students.some(s=>stuGender(s));
+  let gridHTML='';
+  if(S.assignment){const byPos={};for(const a of S.assignment)byPos[`${a.r},${a.c}`]=a;gridHTML=`<div class="mt-6 overflow-x-auto print-grid"><div class="flex justify-center"><div class="inline-block"><div class="mb-2 text-center text-xs text-gray-400 font-medium">— 칠판 —</div><div class="grid gap-1.5" style="grid-template-columns:repeat(${grid.cols},76px)">${Array.from({length:grid.rows},(_,r)=>Array.from({length:grid.cols},(_,c)=>{const cell=grid.cells[r][c];if(!cell.active)return`<div class="rounded-xl cell-inactive border-2 border-dashed border-gray-200" style="width:76px;height:68px"></div>`;const a=byPos[`${r},${c}`];const gCls=cell.gid!==null?`g${cell.gid} border-2`:'bg-white border-2 border-gray-200';const gb=a?(stuGender(a.student)==='M'?'<span class="absolute top-1 right-1 text-xs font-bold text-blue-400">남</span>':stuGender(a.student)==='F'?'<span class="absolute top-1 right-1 text-xs font-bold text-pink-400">여</span>':''):'';return`<div draggable="${a?'true':'false'}" class="relative rounded-xl flex items-center justify-center text-center transition-all select-none ${gCls} ${a?'cursor-grab hover:opacity-80':''}" style="width:76px;height:68px" ondragstart="dragStart(event,${r},${c})" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')" ondrop="dragDrop(event,${r},${c})">${gb}<span class="text-sm font-semibold leading-tight px-1">${a?esc(stuName(a.student)):''}</span></div>`;}).join('')).flat().join('')}</div></div></div></div>`;}
+  return `<div class="space-y-4"><div class="bg-white rounded-2xl p-5 shadow-sm no-print"><div class="flex flex-wrap items-center gap-3">
+    <button data-act="do-assign" ${hasE?'':'disabled'} class="py-2.5 px-6 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white rounded-xl font-semibold text-sm">랜덤 배정</button>
+    ${S.assignment?`<button data-act="save-assign" class="py-2.5 px-6 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold text-sm">기록에 저장</button><button data-act="print-assign" class="py-2.5 px-5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-sm font-medium">인쇄</button>`:''}
+    ${hasG&&hasGdr?`<label class="flex items-center gap-2 ml-auto cursor-pointer select-none"><input type="checkbox" id="gender-balance" ${S.genderBalance?'checked':''} class="w-4 h-4 rounded accent-blue-600"><span class="text-sm font-medium text-gray-700">남녀 혼합 배정</span></label>`:''}
+    ${!hasE?`<p class="text-sm text-amber-600">${cl.students.length===0?'학생을 먼저 입력하세요':'자리를 먼저 설정하세요'}</p>`:''}
+  </div></div>
+  ${!S.assignment&&hasE?`<div class="bg-white rounded-2xl p-10 shadow-sm text-center text-gray-400"><p class="font-medium">배정 결과 없음</p><p class="text-sm mt-1">랜덤 배정 버튼을 누르세요</p></div>`:''}${gridHTML}</div>`;
+}
+
+function renderHistory(cl){
+  if(!cl.history.length)return`<div class="bg-white rounded-2xl p-10 shadow-sm text-center text-gray-400"><p class="font-medium">저장된 기록 없음</p></div>`;
+  return`<div class="space-y-4">${[...cl.history].reverse().map((rec,ri)=>{const idx=cl.history.length-1-ri;const groups={};for(const a of rec.assignments)if(a.gid!==null){if(!groups[a.gid])groups[a.gid]=[];groups[a.gid].push(a);}const indiv=rec.assignments.filter(a=>a.gid===null);return`<div class="bg-white rounded-2xl p-5 shadow-sm"><div class="flex items-center justify-between mb-3"><div><span class="font-bold">${esc(rec.label)}</span><span class="ml-2 text-sm text-gray-400">${rec.date}</span></div><button data-act="delete-record" data-idx="${idx}" class="text-sm text-red-400 hover:text-red-600">삭제</button></div><div class="flex flex-wrap gap-2">${Object.entries(groups).map(([gid,as])=>`<div class="rounded-xl border-2 px-3 py-1.5 g${gid}"><span class="text-xs font-semibold mr-1">${GNAME(parseInt(gid))}</span>${as.map(a=>{const g=stuGender(a.student);return`<span class="text-sm">${esc(stuName(a.student))}${g?`<sup class="text-xs font-bold ${g==='M'?'text-blue-500':'text-pink-500'}">${g==='M'?'남':'여'}</sup>`:''}</span>`;}).join(' ')}</div>`).join('')}${indiv.length?`<div class="rounded-xl border border-gray-200 px-3 py-1.5 bg-gray-50 text-sm">${indiv.map(a=>esc(stuName(a.student))).join(' · ')}</div>`:''}</div></div>`;}).join('')}</div>`;
+}
+
+function renderLineup(cl){
+  const lh=cl.lineupHistory||[];
+  return`<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="space-y-4">
+    <div class="bg-white rounded-2xl p-5 shadow-sm">
+      <h2 class="text-lg font-bold mb-2">무작위 줄세우기</h2>
+      <p class="text-sm text-gray-500 mb-4">앞뒤 인접 쌍 기록을 참고해 배치합니다</p>
+      <button data-act="do-lineup" ${cl.students.length?'':'disabled'} class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white rounded-xl font-semibold text-sm">줄 세우기</button>
+      ${S.lineup?`<button data-act="save-lineup" class="mt-2 w-full py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold text-sm">기록에 저장</button>`:''}
+    </div>
+    ${lh.length?`<div class="bg-white rounded-2xl p-5 shadow-sm"><h2 class="text-base font-bold mb-3">기록</h2><div class="space-y-2 max-h-64 overflow-y-auto">${[...lh].reverse().map((rec,ri)=>{const idx=lh.length-1-ri;return`<div class="flex items-start justify-between gap-2 py-2 border-b border-gray-100 last:border-0"><div><p class="text-xs font-semibold text-gray-700">${esc(rec.date)}</p><p class="text-xs text-gray-400 mt-0.5 truncate">${rec.order.map(s=>stuName(s)).map(esc).join(' → ')}</p></div><button data-act="delete-lineup" data-idx="${idx}" class="text-xs text-red-400 hover:text-red-600 flex-shrink-0">삭제</button></div>`;}).join('')}</div></div>`:''}
+  </div>
+  <div class="lg:col-span-2 bg-white rounded-2xl p-5 shadow-sm">
+    <h2 class="text-lg font-bold mb-4">결과</h2>
+    ${S.lineup?`<ol class="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-1.5">${S.lineup.map((s,i)=>{const g=stuGender(s);return`<li class="flex items-center gap-2.5"><span class="w-6 h-6 rounded-full bg-blue-50 text-blue-700 text-xs font-bold flex items-center justify-center flex-shrink-0">${i+1}</span><span class="text-sm font-medium">${esc(stuName(s))}</span>${g?`<span class="text-xs font-semibold ${g==='M'?'text-blue-400':'text-pink-400'}">${g==='M'?'남':'여'}</span>`:''}</li>`;}).join('')}</ol>`:`<div class="py-12 text-center text-gray-400"><p class="font-medium">결과 없음</p></div>`}
+  </div>
+</div>`;
+}
+
+function bind(){
+  document.getElementById('btn-go-home')?.addEventListener('click',()=>{AUTH.screen='home';renderRoot();});
+  document.getElementById('cl-select')?.addEventListener('change',e=>{S.activeId=e.target.value;S.assignment=null;render();});
+  document.getElementById('gender-balance')?.addEventListener('change',e=>{S.genderBalance=e.target.checked;});
+  document.querySelectorAll('[data-tab]').forEach(b=>{b.addEventListener('click',()=>{S.tab=b.dataset.tab;render();});});
+  document.querySelectorAll('[data-act]').forEach(b=>{b.addEventListener('click',handleAction);});
+}
+
+async function handleAction(e){
+  const act=e.currentTarget.dataset.act,cl=active();
+  if(act==='new-class'){const name=prompt('새 학급 이름');if(!name)return;const c=makeClassroom(name.trim());S.classrooms.push(c);S.activeId=c.id;S.assignment=null;await persist();render();return;}
+  if(act==='save-name'){const v=document.getElementById('cl-name').value.trim();if(!v)return;cl.name=v;await persist();render();return;}
+  if(act==='delete-class'){if(S.classrooms.length<=1){alert('마지막 학급은 삭제할 수 없습니다.');return;}if(!confirm(`"${cl.name}" 삭제?`))return;await call('deleteClassroom',{classroomId:cl.id}).catch(()=>{});S.classrooms=S.classrooms.filter(c=>c.id!==S.activeId);S.activeId=S.classrooms[0].id;S.assignment=null;await persist();render();return;}
+  if(act==='bulk-save'){const text=document.getElementById('bulk-input').value;const names=text.split('\n').map(l=>l.trim()).filter(Boolean);const prev={};for(const s of cl.students)prev[stuName(s)]=stuGender(s);cl.students=names.map(name=>({name,gender:prev[name]||null}));await persist();render();return;}
+  if(act==='toggle-gender'){const i=parseInt(e.currentTarget.dataset.idx);const s=cl.students[i];const cur=stuGender(s);const next=cur===null?'M':cur==='M'?'F':null;cl.students[i]={...(typeof s==='string'?{name:s}:s),gender:next};await persist();render();return;}
+  if(act==='mode-toggle'){S.deskMode='toggle';render();return;}
+  if(act==='mode-group'){S.deskMode='group';render();return;}
+  if(act==='pick-group'){S.paintGid=parseInt(e.currentTarget.dataset.gid);render();return;}
+  if(act==='cell-click'){const r=parseInt(e.currentTarget.dataset.r),c=parseInt(e.currentTarget.dataset.c);const cell=cl.grid.cells[r][c];if(S.deskMode==='toggle'){cell.active=!cell.active;if(!cell.active)cell.gid=null;}else{if(!cell.active)cell.active=true;cell.gid=S.paintGid>=0?S.paintGid:null;}await persist();render();return;}
+  if(act==='resize-grid'){const rows=parseInt(document.getElementById('grid-rows').value),cols=parseInt(document.getElementById('grid-cols').value);const ng=makeGrid(rows,cols);for(let r=0;r<Math.min(rows,cl.grid.rows);r++)for(let c=0;c<Math.min(cols,cl.grid.cols);c++)ng.cells[r][c]={...cl.grid.cells[r][c]};cl.grid=ng;await persist();render();return;}
+  if(act==='reset-grid'){if(!confirm('배치 초기화?'))return;cl.grid=makeGrid(cl.grid.rows,cl.grid.cols);await persist();render();return;}
+  if(act==='do-assign'){S.assignment=generateAssignment(cl,S.genderBalance);render();return;}
+  if(act==='save-assign'){if(!S.assignment)return;const now=new Date();const d=`${now.getFullYear()}.${String(now.getMonth()+1).padStart(2,'0')}.${String(now.getDate()).padStart(2,'0')}`;const t=`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;const rec={id:genId(),date:`${d} ${t}`,label:`${d} 자리배정`,assignments:S.assignment};cl.history.push(rec);await persist();call('saveHistoryRecord',{classroomId:cl.id,record:rec}).catch(()=>{});render();return;}
+  if(act==='print-assign'){window.print();return;}
+  if(act==='delete-record'){if(!confirm('삭제?'))return;const idx=parseInt(e.currentTarget.dataset.idx);const rec=cl.history.splice(idx,1)[0];await persist();call('deleteHistoryRecord',{classroomId:cl.id,recordId:rec.id}).catch(()=>{});render();return;}
+  if(act==='do-lineup'){S.lineup=generateLineup(cl);render();return;}
+  if(act==='save-lineup'){if(!S.lineup)return;if(!cl.lineupHistory)cl.lineupHistory=[];const now=new Date();const d=`${now.getFullYear()}.${String(now.getMonth()+1).padStart(2,'0')}.${String(now.getDate()).padStart(2,'0')}`;const t=`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;const rec={id:genId(),date:`${d} ${t}`,order:S.lineup};cl.lineupHistory.push(rec);await persist();call('saveLineupRecord',{classroomId:cl.id,record:rec}).catch(()=>{});render();return;}
+  if(act==='delete-lineup'){if(!confirm('삭제?'))return;const idx=parseInt(e.currentTarget.dataset.idx);const rec=cl.lineupHistory.splice(idx,1)[0];await persist();call('deleteLineupRecord',{classroomId:cl.id,recordId:rec.id}).catch(()=>{});render();return;}
+}
+
+function render(){ AUTH.screen='app'; renderRoot(); }
+function dragStart(e,r,c){S.dragSrc={r,c};e.dataTransfer.effectAllowed='move';}
+function dragDrop(e,r,c){e.preventDefault();e.currentTarget.classList.remove('drag-over');if(!S.dragSrc||(S.dragSrc.r===r&&S.dragSrc.c===c)||!S.assignment)return;const src=S.assignment.find(a=>a.r===S.dragSrc.r&&a.c===S.dragSrc.c);const dst=S.assignment.find(a=>a.r===r&&a.c===c);if(src&&dst){[src.r,src.c,src.gid,dst.r,dst.c,dst.gid]=[dst.r,dst.c,dst.gid,src.r,src.c,src.gid];}else if(src){src.r=r;src.c=c;src.gid=active().grid.cells[r][c].gid;}S.dragSrc=null;render();}
+
+/* ======================================================
+   앱 시작
+   ====================================================== */
+(async function init(){
+  AUTH.screen='loading'; renderRoot();
+  // PIN 세션 캐시 확인
+  const sess = loadPinSession();
+  if (sess) {
+    AUTH.user = { email: sess.email, name: sess.email.split('@')[0] };
+    AUTH.screen = 'home';
+    await loadData();
+    renderRoot();
+    return;
+  }
+  // 구글 로그인 화면으로
+  AUTH.screen = 'google-login';
+  renderRoot();
+})();
+</script>
+</body>
+</html>
